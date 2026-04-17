@@ -40,6 +40,23 @@ class ContentResult(BaseModel):
 FilmResult = ContentResult
 
 
+class PhysicalFormat(str, Enum):
+    dvd = "DVD"
+    bluray = "Blu-ray"
+    uhd_4k = "4K UHD"
+
+
+class PhysicalOffer(BaseModel):
+    title: str
+    retailer: str = "bol.com"
+    format: PhysicalFormat
+    edition: str | None = None
+    price_eur: float | None = None
+    url: str | None = None
+    image_url: str | None = None
+    in_stock: bool = True
+
+
 class AvailabilityEvent(BaseModel):
     event: str  # "film_meta" | "offer" | "done" | "error"
     data: dict
