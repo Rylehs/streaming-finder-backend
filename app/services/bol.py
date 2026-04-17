@@ -1,9 +1,9 @@
 """
-Support physique bol.com — DuckDuckGo (sans clé API) + scraping page de recherche + JSON-LD.
+Support physique bol.com — DDG HTML interface + scraping bol.com + JSON-LD.
 
 Flux :
-  1a. DuckDuckGo text search (query simple, sans site:) → URLs produits bol.com
-  1b. Scraping direct page de recherche bol.com/be → URLs produits (/be/*/p/...)
+  1a. DDG HTML interface (POST async, sans bibliothèque) → URLs produits bol.com
+  1b. Scraping direct page de recherche bol.com/be → URLs produits
   2.  Fetch de chaque page produit → extraction JSON-LD (prix, stock, titre)
   3.  Tri par qualité (4K > Blu-ray > DVD) puis prix
 """
@@ -12,7 +12,7 @@ import json as json_lib
 import logging
 import re
 from typing import Any
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, unquote
 
 import httpx
 
@@ -56,7 +56,16 @@ _BOL_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-# Regex pour extraire des URLs produits bol.com depuis du HTML brut
+_DDG_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "fr-BE,fr;q=0.9",
+    "Content-Type": "application/x-www-form-urlencoded",
+    "Referer": "https://duckduckgo.com/",
+    "Origin": "https://duckduckgo.com",
+}
+
+# Regex : URLs produits bol.com (chemin /be/xx/p/...)
 _BOL_PRODUCT_RE = re.compile(
     r'(?:https?://(?:www\.)?bol\.com)?(/be/[a-z]{2}/p/[^\s"\'?#<>]+)'
 )
@@ -95,7 +104,7 @@ def _parse_jsonld(html: str) -> dict[str, Any] | None:
 
 
 def _extract_bol_urls(html: str, max_results: int = 12) -> list[str]:
-    """Extrait les URLs produits bol.com d'une page HTML."""
+    """Extrait les URLs produits bol.com depuis du HTML brut."""
     seen: set[str] = set()
     urls: list[str] = []
     for m in _BOL_PRODUCT_RE.finditer(html):
@@ -111,7 +120,7 @@ def _extract_bol_urls(html: str, max_results: int = 12) -> list[str]:
 
 async def _fetch_product(url: str, client: httpx.AsyncClient) -> PhysicalOffer | None:
     try:
-        resp = await client.get(url, headers=_BOL_HEADERS, follow_redirects=True, timeout=8)
+        resp = await client.get(url, headers=_BOL_HEADERS, follow_redirects=True, timeout=6)
         if resp.status_code != 200:
             return None
     except Exception as e:
@@ -162,44 +171,65 @@ async def _fetch_product(url: str, client: httpx.AsyncClient) -> PhysicalOffer |
     )
 
 
-def _ddg_search(query: str, max_results: int = 10) -> list[str]:
+async def _ddg_html_search(
+    query: str, client: httpx.AsyncClient, max_results: int = 8
+) -> list[str]:
     """
-    Recherche DuckDuckGo synchrone → liste d'URLs bol.com.
-    NOTE: site:bol.com/be ne fonctionne pas dans DDG (chemin non supporté).
-          On cherche sans opérateur site: et on filtre ensuite.
+    Recherche via l'interface HTML de DuckDuckGo (POST, sans bibliothèque).
+    Les URLs sont encodées dans le paramètre uddg= de chaque lien de résultat.
     """
     try:
-        from duckduckgo_search import DDGS
-        # On demande 4× plus de résultats car on va filtrer sur bol.com
-        results = DDGS().text(query, max_results=max_results * 4)
-        urls = [
-            r["href"] for r in (results or [])
-            if "bol.com" in r.get("href", "") and "/p/" in r.get("href", "")
-        ]
-        logger.debug("DDG returned %d bol.com product URLs", len(urls))
+        resp = await client.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": query, "kl": "be-fr"},
+            headers=_DDG_HEADERS,
+            follow_redirects=True,
+            timeout=8,
+        )
+        if resp.status_code != 200:
+            logger.debug("DDG HTML status %d", resp.status_code)
+            return []
+
+        urls: list[str] = []
+        seen: set[str] = set()
+        # Chaque résultat DDG a href="/l/?uddg=<URL-encodée>"
+        for m in re.finditer(r'uddg=(https?[^&"\'<\s]+)', resp.text):
+            decoded = unquote(m.group(1))
+            if "bol.com" in decoded and "/p/" in decoded:
+                clean = decoded.split("?")[0].rstrip("/") + "/"
+                if clean not in seen:
+                    seen.add(clean)
+                    urls.append(clean)
+
+        logger.info("DDG HTML found %d bol.com URLs for '%s'", len(urls), query)
         return urls[:max_results]
-    except Exception as exc:
-        logger.error("DuckDuckGo search error: %s", exc)
+    except Exception as e:
+        logger.warning("DDG HTML search error: %s", e)
         return []
 
 
-async def _bol_search_page(title: str, client: httpx.AsyncClient) -> list[str]:
+async def _bol_search_page(
+    title: str, client: httpx.AsyncClient
+) -> list[str]:
     """
-    Scrape la page de résultats de recherche bol.com/be directement.
-    Plus fiable que DDG car indépendant des limites de l'API de recherche.
+    Scrape la page de résultats bol.com/be.
+    La page est rendue côté serveur : les liens produit sont dans le HTML.
     """
     query = f"{title} blu-ray dvd"
     url = f"https://www.bol.com/be/fr/s/?q={quote_plus(query)}"
     try:
-        resp = await client.get(url, headers=_BOL_HEADERS, follow_redirects=True, timeout=10)
+        resp = await client.get(
+            url, headers=_BOL_HEADERS, follow_redirects=True, timeout=8
+        )
         if resp.status_code != 200:
-            logger.debug("bol.com search page returned %d", resp.status_code)
+            logger.debug("bol.com search page status %d", resp.status_code)
             return []
+
         urls = _extract_bol_urls(resp.text)
-        logger.debug("bol.com search page found %d product URLs", len(urls))
+        logger.info("bol.com search page found %d URLs for '%s'", len(urls), title)
         return urls
     except Exception as e:
-        logger.debug("bol.com search page error: %s", e)
+        logger.warning("bol.com search page error: %s", e)
         return []
 
 
@@ -210,22 +240,18 @@ async def search_physical(
     tmdb_id: int,
     content_type: str = "movie",
 ) -> list[PhysicalOffer]:
-    cache_key = f"bol:physical:v5:{tmdb_id}:{content_type}"
+    cache_key = f"bol:physical:v6:{tmdb_id}:{content_type}"
     cached = await cache.get(cache_key)
     if cached:
         return [PhysicalOffer(**o) for o in cached]
 
     search_title = original_title or title
-    # Query DDG sans opérateur site: — on mentionne simplement "bol.com" pour biaiser les résultats
-    ddg_query = f'"{search_title}" blu-ray bol.com'
+    ddg_query = f'"{search_title}" blu-ray dvd bol.com'
 
     async with httpx.AsyncClient() as client:
-        loop = asyncio.get_event_loop()
-
-        # DDG (synchrone → executor) + scraping page bol.com en parallèle
-        ddg_future = loop.run_in_executor(None, _ddg_search, ddg_query, 8)
+        # Deux sources en parallèle
         ddg_urls, bol_urls = await asyncio.gather(
-            ddg_future,
+            _ddg_html_search(ddg_query, client, 8),
             _bol_search_page(search_title, client),
             return_exceptions=True,
         )
@@ -234,7 +260,7 @@ async def search_physical(
             logger.warning("DDG task error: %s", ddg_urls)
             ddg_urls = []
         if isinstance(bol_urls, Exception):
-            logger.warning("bol search page error: %s", bol_urls)
+            logger.warning("bol search page task error: %s", bol_urls)
             bol_urls = []
 
         # Fusion + déduplication (DDG en priorité)
@@ -246,7 +272,7 @@ async def search_physical(
                 all_urls.append(u)
 
         logger.info(
-            "bol.com URLs for '%s': %d total (DDG: %d, search page: %d)",
+            "Total URLs for '%s': %d (DDG: %d, bol page: %d)",
             search_title, len(all_urls), len(ddg_urls), len(bol_urls),
         )
 
@@ -254,7 +280,7 @@ async def search_physical(
             return []
 
         results = await asyncio.gather(
-            *[_fetch_product(url, client) for url in all_urls[:10]],
+            *[_fetch_product(url, client) for url in all_urls[:8]],
             return_exceptions=True,
         )
 
