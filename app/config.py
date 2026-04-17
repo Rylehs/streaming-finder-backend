@@ -11,6 +11,8 @@ class Settings(BaseSettings):
     country: str = "BE"
     language: str = "fr"
     allowed_origins: str = "*"  # ex: "https://mon-app.vercel.app" en production
+    google_api_key: str = ""
+    google_cse_id: str = ""
 
     class Config:
         # En local : charge le .env ; en production : variables d'environnement directes

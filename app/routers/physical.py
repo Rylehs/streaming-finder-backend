@@ -16,11 +16,23 @@ async def get_physical(
     if content is None:
         raise HTTPException(status_code=404, detail=f"Contenu TMDB #{tmdb_id} introuvable")
 
-    has_physical = await bol.has_physical_release(tmdb_id, content_type=type)
+    # Recherche parallèle : vérification existence + produits bol.com
+    import asyncio
+    has_physical, offers = await asyncio.gather(
+        bol.has_physical_release(tmdb_id, content_type=type),
+        bol.search_physical(
+            title=content.title,
+            original_title=content.original_title,
+            year=content.year,
+            tmdb_id=tmdb_id,
+            content_type=type,
+        ),
+    )
 
     return {
         "has_physical": has_physical,
         "title": content.title,
         "original_title": content.original_title,
         "year": content.year,
+        "offers": [o.model_dump() for o in offers],
     }
