@@ -16,12 +16,11 @@ async def get_physical(
     if content is None:
         raise HTTPException(status_code=404, detail=f"Contenu TMDB #{tmdb_id} introuvable")
 
-    offers = await bol.search_physical(
-        title=content.title,
-        original_title=content.original_title,
-        year=content.year,
-        tmdb_id=tmdb_id,
-        content_type=type,
-    )
+    has_physical = await bol.has_physical_release(tmdb_id, content_type=type)
 
-    return {"offers": [o.model_dump() for o in offers], "total": len(offers)}
+    return {
+        "has_physical": has_physical,
+        "title": content.title,
+        "original_title": content.original_title,
+        "year": content.year,
+    }

@@ -11,8 +11,6 @@ class Settings(BaseSettings):
     country: str = "BE"
     language: str = "fr"
     allowed_origins: str = "*"  # ex: "https://mon-app.vercel.app" en production
-    bol_client_id: str = ""
-    bol_client_secret: str = ""
 
     class Config:
         # En local : charge le .env ; en production : variables d'environnement directes
