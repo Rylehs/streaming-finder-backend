@@ -1,18 +1,29 @@
 """
-Support physique bol.com — Bing HTML + Wayback Machine CDX + JSON-LD.
+Support physique bol.com — Google Custom Search (optionnel) + JSON-LD.
 
-Flux :
-  1a. Bing HTML search (site:bol.com, async, sans clé) → URLs produits
-  1b. Wayback Machine CDX API (public, non bloqué) → URLs produits archivées
-  2.  Fetch de chaque page produit bol.com → extraction JSON-LD (prix, stock)
-  3.  Tri par qualité (4K > Blu-ray > DVD) puis prix
+Pourquoi Google CSE ?
+  bol.com bloque les IPs cloud (résultats de recherche chargés en JS, pas
+  d'API publique, sitemaps inexploitables en temps réel). Bing/DDG retournent
+  des pages CAPTCHA depuis les datacenter AWS de Vercel.
+
+  Google Custom Search est la seule approche gratuite (100 req/jour) qui
+  fonctionne depuis des IPs cloud. Elle nécessite une configuration unique :
+    1. https://programmablesearchengine.google.com/ → créer un moteur "bol.com"
+    2. Google Cloud Console → activer Custom Search API → créer une clé
+    3. Ajouter GOOGLE_CSE_KEY et GOOGLE_CSE_ID dans les variables Vercel
+
+  Si ces variables sont absentes, la section support physique est masquée.
+
+Flux (quand Google CSE est configuré) :
+  1. Google CSE : "{titre}" (blu-ray OR dvd OR "4K UHD") → URLs produits bol.com
+  2. Fetch de chaque page produit → extraction JSON-LD (prix, stock, titre)
+  3. Tri par qualité (4K > Blu-ray > DVD) puis prix
 """
 import asyncio
 import json as json_lib
 import logging
 import re
 from typing import Any
-from urllib.parse import quote_plus
 
 import httpx
 
@@ -60,11 +71,6 @@ _BOL_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-# Regex URL produit bol.com
-_BOL_PRODUCT_RE = re.compile(
-    r'https?://(?:www\.)?bol\.com(/(?:be|nl)/[a-z]{2}/p/[^\s"\'?#<>]+)'
-)
-
 
 def _detect_format(title: str) -> PhysicalFormat | None:
     lower = title.lower()
@@ -96,15 +102,6 @@ def _parse_jsonld(html: str) -> dict[str, Any] | None:
         except Exception:
             continue
     return None
-
-
-def _normalize_bol_url(raw: str) -> str | None:
-    """Extrait et normalise une URL produit bol.com."""
-    m = _BOL_PRODUCT_RE.search(raw)
-    if not m:
-        return None
-    path = m.group(1).rstrip("/") + "/"
-    return f"https://www.bol.com{path}"
 
 
 async def _fetch_product(url: str, client: httpx.AsyncClient) -> PhysicalOffer | None:
@@ -160,106 +157,45 @@ async def _fetch_product(url: str, client: httpx.AsyncClient) -> PhysicalOffer |
     )
 
 
-async def _bing_search(
+async def _google_cse_search(
     title: str, client: httpx.AsyncClient, max_results: int = 8
 ) -> list[str]:
     """
-    Bing HTML search (sans clé API).
-    - Supporte site:bol.com correctement (contrairement à DDG)
-    - Moins agressif sur les IP cloud que DDG
+    Google Custom Search API — la seule approche gratuite fiable depuis les IPs cloud.
+    Nécessite GOOGLE_CSE_KEY et GOOGLE_CSE_ID dans les variables d'environnement.
     """
-    query = f'"{title}" (blu-ray OR dvd OR "4K UHD") site:bol.com'
-    url = f"https://www.bing.com/search?q={quote_plus(query)}&setlang=fr&cc=BE&count=15"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "fr-BE,fr;q=0.9,en;q=0.8",
-    }
-    try:
-        resp = await client.get(url, headers=headers, follow_redirects=True, timeout=7)
-        if resp.status_code != 200:
-            logger.debug("Bing status %d", resp.status_code)
-            return []
-
-        seen: set[str] = set()
-        urls: list[str] = []
-
-        # Bing encode les URLs cibles dans data-href="" ou href="" des résultats
-        for raw in re.findall(
-            r'(?:href|data-href)="(https?://(?:www\.)?bol\.com/[^"?#]+)"',
-            resp.text
-        ):
-            norm = _normalize_bol_url(raw)
-            if norm and norm not in seen:
-                seen.add(norm)
-                urls.append(norm)
-
-        logger.info("Bing found %d bol.com URLs for '%s'", len(urls), title)
-        return urls[:max_results]
-    except Exception as e:
-        logger.warning("Bing search error: %s", e)
+    if not settings.google_cse_key or not settings.google_cse_id:
         return []
 
-
-async def _wayback_search(
-    title: str, client: httpx.AsyncClient, max_results: int = 6
-) -> list[str]:
-    """
-    Wayback Machine CDX API — toujours accessible depuis les IPs cloud.
-    Trouve les URLs de pages produit bol.com archivées via le slug du titre.
-    """
-    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:30]
-
-    # On essaie les deux chemins bol.com BE (fr + nl)
-    cdx_base = "https://web.archive.org/cdx/search/cdx"
-    paths = [f"www.bol.com/be/nl/p/{slug}", f"www.bol.com/be/fr/p/{slug}"]
-
-    async def _cdx_query(prefix: str) -> list[str]:
-        try:
-            resp = await client.get(
-                cdx_base,
-                params={
-                    "url": prefix + "*",
-                    "output": "json",
-                    "fl": "original",
-                    "collapse": "urlkey",
-                    "filter": "statuscode:200",
-                    "limit": "6",
-                    "from": "20230101",
-                },
-                timeout=7,
-            )
-            if resp.status_code != 200:
-                return []
-            data = resp.json()
-            result = []
-            for row in data[1:]:  # ligne 0 = en-tête
-                original = row[0] if isinstance(row, list) else ""
-                norm = _normalize_bol_url(original) if original else None
-                if norm:
-                    result.append(norm)
-            return result
-        except Exception as e:
-            logger.debug("CDX query error (%s): %s", prefix, e)
+    query = f'"{title}" (blu-ray OR dvd OR "4K UHD")'
+    try:
+        resp = await client.get(
+            "https://www.googleapis.com/customsearch/v1",
+            params={
+                "key": settings.google_cse_key,
+                "cx":  settings.google_cse_id,
+                "q":   query,
+                "num": min(max_results, 10),
+                "gl":  "be",
+                "hl":  "fr",
+            },
+            timeout=8,
+        )
+        if resp.status_code != 200:
+            logger.warning("Google CSE status %d: %s", resp.status_code, resp.text[:200])
             return []
 
-    results = await asyncio.gather(*[_cdx_query(p) for p in paths], return_exceptions=True)
-
-    seen: set[str] = set()
-    urls: list[str] = []
-    for batch in results:
-        if isinstance(batch, list):
-            for u in batch:
-                if u not in seen:
-                    seen.add(u)
-                    urls.append(u)
-
-    logger.info("Wayback CDX found %d URLs for slug '%s'", len(urls), slug)
-    return urls[:max_results]
+        data = resp.json()
+        urls = [
+            item["link"]
+            for item in data.get("items", [])
+            if "bol.com" in item.get("link", "") and "/p/" in item.get("link", "")
+        ]
+        logger.info("Google CSE found %d bol.com URLs for '%s'", len(urls), title)
+        return urls
+    except Exception as e:
+        logger.warning("Google CSE error: %s", e)
+        return []
 
 
 async def search_physical(
@@ -269,46 +205,33 @@ async def search_physical(
     tmdb_id: int,
     content_type: str = "movie",
 ) -> list[PhysicalOffer]:
-    cache_key = f"bol:physical:v7:{tmdb_id}:{content_type}"
+    cache_key = f"bol:physical:v8:{tmdb_id}:{content_type}"
     cached = await cache.get(cache_key)
     if cached:
         return [PhysicalOffer(**o) for o in cached]
 
+    # Sans Google CSE configuré, la recherche automatique est impossible
+    if not settings.google_cse_key or not settings.google_cse_id:
+        logger.info("Google CSE non configuré — support physique désactivé")
+        return []
+
     search_title = original_title or title
 
     async with httpx.AsyncClient() as client:
-        # Sources en parallèle
-        bing_urls, wayback_urls = await asyncio.gather(
-            _bing_search(search_title, client),
-            _wayback_search(search_title, client),
-            return_exceptions=True,
-        )
+        urls = await _google_cse_search(search_title, client, max_results=8)
 
-        if isinstance(bing_urls, Exception):
-            logger.warning("Bing task error: %s", bing_urls)
-            bing_urls = []
-        if isinstance(wayback_urls, Exception):
-            logger.warning("Wayback task error: %s", wayback_urls)
-            wayback_urls = []
+        if not urls:
+            # Retry avec le titre localisé si différent
+            if title != original_title:
+                urls = await _google_cse_search(title, client, max_results=8)
 
-        # Fusion + déduplication (Bing en priorité)
-        seen: set[str] = set()
-        all_urls: list[str] = []
-        for u in list(bing_urls) + list(wayback_urls):
-            if u not in seen:
-                seen.add(u)
-                all_urls.append(u)
+        logger.info("Total URLs for '%s': %d", search_title, len(urls))
 
-        logger.info(
-            "URLs for '%s': %d total (Bing: %d, Wayback: %d)",
-            search_title, len(all_urls), len(bing_urls), len(wayback_urls),
-        )
-
-        if not all_urls:
+        if not urls:
             return []
 
         results = await asyncio.gather(
-            *[_fetch_product(url, client) for url in all_urls[:8]],
+            *[_fetch_product(url, client) for url in urls],
             return_exceptions=True,
         )
 
