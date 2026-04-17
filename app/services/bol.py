@@ -160,41 +160,57 @@ async def _fetch_product(url: str, client: httpx.AsyncClient) -> PhysicalOffer |
 async def _google_cse_search(
     title: str, client: httpx.AsyncClient, max_results: int = 8
 ) -> list[str]:
-    """
-    Google Custom Search API — la seule approche gratuite fiable depuis les IPs cloud.
-    Nécessite GOOGLE_CSE_KEY et GOOGLE_CSE_ID dans les variables d'environnement.
-    """
+    """Google Custom Search API — nécessite GOOGLE_CSE_KEY + GOOGLE_CSE_ID."""
     if not settings.google_cse_key or not settings.google_cse_id:
         return []
-
     query = f'"{title}" (blu-ray OR dvd OR "4K UHD")'
     try:
         resp = await client.get(
             "https://www.googleapis.com/customsearch/v1",
-            params={
-                "key": settings.google_cse_key,
-                "cx":  settings.google_cse_id,
-                "q":   query,
-                "num": min(max_results, 10),
-                "gl":  "be",
-                "hl":  "fr",
-            },
+            params={"key": settings.google_cse_key, "cx": settings.google_cse_id,
+                    "q": query, "num": min(max_results, 10), "gl": "be", "hl": "fr"},
             timeout=8,
         )
         if resp.status_code != 200:
             logger.warning("Google CSE status %d: %s", resp.status_code, resp.text[:200])
             return []
-
         data = resp.json()
-        urls = [
-            item["link"]
-            for item in data.get("items", [])
-            if "bol.com" in item.get("link", "") and "/p/" in item.get("link", "")
-        ]
-        logger.info("Google CSE found %d bol.com URLs for '%s'", len(urls), title)
+        urls = [it["link"] for it in data.get("items", [])
+                if "bol.com" in it.get("link", "") and "/p/" in it.get("link", "")]
+        logger.info("Google CSE found %d URLs for '%s'", len(urls), title)
         return urls
     except Exception as e:
         logger.warning("Google CSE error: %s", e)
+        return []
+
+
+async def _serpapi_search(
+    title: str, client: httpx.AsyncClient, max_results: int = 8
+) -> list[str]:
+    """SerpAPI — 100 req/mois gratuits, nécessite SERPAPI_KEY."""
+    if not settings.serpapi_key:
+        return []
+    query = f'"{title}" (blu-ray OR dvd OR "4K UHD") site:bol.com'
+    try:
+        resp = await client.get(
+            "https://serpapi.com/search.json",
+            params={"q": query, "location": "Belgium", "hl": "fr", "gl": "be",
+                    "api_key": settings.serpapi_key, "num": max_results},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logger.warning("SerpAPI status %d: %s", resp.status_code, resp.text[:200])
+            return []
+        data = resp.json()
+        urls = [
+            r.get("link", "")
+            for r in data.get("organic_results", [])
+            if "bol.com" in r.get("link", "") and "/p/" in r.get("link", "")
+        ]
+        logger.info("SerpAPI found %d URLs for '%s'", len(urls), title)
+        return urls
+    except Exception as e:
+        logger.warning("SerpAPI error: %s", e)
         return []
 
 
@@ -210,20 +226,27 @@ async def search_physical(
     if cached:
         return [PhysicalOffer(**o) for o in cached]
 
-    # Sans Google CSE configuré, la recherche automatique est impossible
-    if not settings.google_cse_key or not settings.google_cse_id:
-        logger.info("Google CSE non configuré — support physique désactivé")
+    # Sans aucune clé configurée, la recherche automatique est impossible
+    has_google = bool(settings.google_cse_key and settings.google_cse_id)
+    has_serp   = bool(settings.serpapi_key)
+    if not has_google and not has_serp:
+        logger.info("Aucune clé de recherche configurée — support physique désactivé")
         return []
 
     search_title = original_title or title
 
     async with httpx.AsyncClient() as client:
-        urls = await _google_cse_search(search_title, client, max_results=8)
+        # Utiliser la première API disponible
+        if has_google:
+            urls = await _google_cse_search(search_title, client, max_results=8)
+        else:
+            urls = await _serpapi_search(search_title, client, max_results=8)
 
-        if not urls:
-            # Retry avec le titre localisé si différent
-            if title != original_title:
+        if not urls and title != original_title:
+            if has_google:
                 urls = await _google_cse_search(title, client, max_results=8)
+            else:
+                urls = await _serpapi_search(title, client, max_results=8)
 
         logger.info("Total URLs for '%s': %d", search_title, len(urls))
 
