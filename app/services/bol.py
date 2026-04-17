@@ -97,8 +97,21 @@ def _parse_jsonld(html: str) -> dict[str, Any] | None:
             data = json_lib.loads(match.group(1).strip())
             items = data if isinstance(data, list) else [data]
             for item in items:
-                if item.get("@type") == "Product":
+                t = item.get("@type")
+                if t == "Product":
                     return item
+                if t == "Movie":
+                    # bol.com utilise @type:Movie avec le prix dans workExample[0].offers
+                    work = item.get("workExample", [])
+                    if isinstance(work, dict):
+                        work = [work]
+                    w = work[0] if work else {}
+                    return {
+                        "@type": "Product",
+                        "name": w.get("name") or item.get("name", ""),
+                        "offers": w.get("offers", {}),
+                        "image": item.get("image"),
+                    }
         except Exception:
             continue
     return None
