@@ -1,10 +1,10 @@
 """
-Support physique bol.com — DDG HTML interface + scraping bol.com + JSON-LD.
+Support physique bol.com — Bing HTML + Wayback Machine CDX + JSON-LD.
 
 Flux :
-  1a. DDG HTML interface (POST async, sans bibliothèque) → URLs produits bol.com
-  1b. Scraping direct page de recherche bol.com/be → URLs produits
-  2.  Fetch de chaque page produit → extraction JSON-LD (prix, stock, titre)
+  1a. Bing HTML search (site:bol.com, async, sans clé) → URLs produits
+  1b. Wayback Machine CDX API (public, non bloqué) → URLs produits archivées
+  2.  Fetch de chaque page produit bol.com → extraction JSON-LD (prix, stock)
   3.  Tri par qualité (4K > Blu-ray > DVD) puis prix
 """
 import asyncio
@@ -12,7 +12,7 @@ import json as json_lib
 import logging
 import re
 from typing import Any
-from urllib.parse import quote_plus, unquote
+from urllib.parse import quote_plus
 
 import httpx
 
@@ -51,23 +51,18 @@ EDITION_PATTERNS: list[tuple[str, str]] = [
 ]
 
 _BOL_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
     "Accept-Language": "fr-BE,fr;q=0.9,nl-BE;q=0.8",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-_DDG_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "fr-BE,fr;q=0.9",
-    "Content-Type": "application/x-www-form-urlencoded",
-    "Referer": "https://duckduckgo.com/",
-    "Origin": "https://duckduckgo.com",
-}
-
-# Regex : URLs produits bol.com (chemin /be/xx/p/...)
+# Regex URL produit bol.com
 _BOL_PRODUCT_RE = re.compile(
-    r'(?:https?://(?:www\.)?bol\.com)?(/be/[a-z]{2}/p/[^\s"\'?#<>]+)'
+    r'https?://(?:www\.)?bol\.com(/(?:be|nl)/[a-z]{2}/p/[^\s"\'?#<>]+)'
 )
 
 
@@ -103,19 +98,13 @@ def _parse_jsonld(html: str) -> dict[str, Any] | None:
     return None
 
 
-def _extract_bol_urls(html: str, max_results: int = 12) -> list[str]:
-    """Extrait les URLs produits bol.com depuis du HTML brut."""
-    seen: set[str] = set()
-    urls: list[str] = []
-    for m in _BOL_PRODUCT_RE.finditer(html):
-        path = m.group(1).rstrip("/") + "/"
-        url = f"https://www.bol.com{path}"
-        if url not in seen:
-            seen.add(url)
-            urls.append(url)
-        if len(urls) >= max_results:
-            break
-    return urls
+def _normalize_bol_url(raw: str) -> str | None:
+    """Extrait et normalise une URL produit bol.com."""
+    m = _BOL_PRODUCT_RE.search(raw)
+    if not m:
+        return None
+    path = m.group(1).rstrip("/") + "/"
+    return f"https://www.bol.com{path}"
 
 
 async def _fetch_product(url: str, client: httpx.AsyncClient) -> PhysicalOffer | None:
@@ -171,66 +160,106 @@ async def _fetch_product(url: str, client: httpx.AsyncClient) -> PhysicalOffer |
     )
 
 
-async def _ddg_html_search(
-    query: str, client: httpx.AsyncClient, max_results: int = 8
+async def _bing_search(
+    title: str, client: httpx.AsyncClient, max_results: int = 8
 ) -> list[str]:
     """
-    Recherche via l'interface HTML de DuckDuckGo (POST, sans bibliothèque).
-    Les URLs sont encodées dans le paramètre uddg= de chaque lien de résultat.
+    Bing HTML search (sans clé API).
+    - Supporte site:bol.com correctement (contrairement à DDG)
+    - Moins agressif sur les IP cloud que DDG
     """
+    query = f'"{title}" (blu-ray OR dvd OR "4K UHD") site:bol.com'
+    url = f"https://www.bing.com/search?q={quote_plus(query)}&setlang=fr&cc=BE&count=15"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "fr-BE,fr;q=0.9,en;q=0.8",
+    }
     try:
-        resp = await client.post(
-            "https://html.duckduckgo.com/html/",
-            data={"q": query, "kl": "be-fr"},
-            headers=_DDG_HEADERS,
-            follow_redirects=True,
-            timeout=8,
-        )
+        resp = await client.get(url, headers=headers, follow_redirects=True, timeout=7)
         if resp.status_code != 200:
-            logger.debug("DDG HTML status %d", resp.status_code)
+            logger.debug("Bing status %d", resp.status_code)
             return []
 
-        urls: list[str] = []
         seen: set[str] = set()
-        # Chaque résultat DDG a href="/l/?uddg=<URL-encodée>"
-        for m in re.finditer(r'uddg=(https?[^&"\'<\s]+)', resp.text):
-            decoded = unquote(m.group(1))
-            if "bol.com" in decoded and "/p/" in decoded:
-                clean = decoded.split("?")[0].rstrip("/") + "/"
-                if clean not in seen:
-                    seen.add(clean)
-                    urls.append(clean)
+        urls: list[str] = []
 
-        logger.info("DDG HTML found %d bol.com URLs for '%s'", len(urls), query)
+        # Bing encode les URLs cibles dans data-href="" ou href="" des résultats
+        for raw in re.findall(
+            r'(?:href|data-href)="(https?://(?:www\.)?bol\.com/[^"?#]+)"',
+            resp.text
+        ):
+            norm = _normalize_bol_url(raw)
+            if norm and norm not in seen:
+                seen.add(norm)
+                urls.append(norm)
+
+        logger.info("Bing found %d bol.com URLs for '%s'", len(urls), title)
         return urls[:max_results]
     except Exception as e:
-        logger.warning("DDG HTML search error: %s", e)
+        logger.warning("Bing search error: %s", e)
         return []
 
 
-async def _bol_search_page(
-    title: str, client: httpx.AsyncClient
+async def _wayback_search(
+    title: str, client: httpx.AsyncClient, max_results: int = 6
 ) -> list[str]:
     """
-    Scrape la page de résultats bol.com/be.
-    La page est rendue côté serveur : les liens produit sont dans le HTML.
+    Wayback Machine CDX API — toujours accessible depuis les IPs cloud.
+    Trouve les URLs de pages produit bol.com archivées via le slug du titre.
     """
-    query = f"{title} blu-ray dvd"
-    url = f"https://www.bol.com/be/fr/s/?q={quote_plus(query)}"
-    try:
-        resp = await client.get(
-            url, headers=_BOL_HEADERS, follow_redirects=True, timeout=8
-        )
-        if resp.status_code != 200:
-            logger.debug("bol.com search page status %d", resp.status_code)
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:30]
+
+    # On essaie les deux chemins bol.com BE (fr + nl)
+    cdx_base = "https://web.archive.org/cdx/search/cdx"
+    paths = [f"www.bol.com/be/nl/p/{slug}", f"www.bol.com/be/fr/p/{slug}"]
+
+    async def _cdx_query(prefix: str) -> list[str]:
+        try:
+            resp = await client.get(
+                cdx_base,
+                params={
+                    "url": prefix + "*",
+                    "output": "json",
+                    "fl": "original",
+                    "collapse": "urlkey",
+                    "filter": "statuscode:200",
+                    "limit": "6",
+                    "from": "20230101",
+                },
+                timeout=7,
+            )
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+            result = []
+            for row in data[1:]:  # ligne 0 = en-tête
+                original = row[0] if isinstance(row, list) else ""
+                norm = _normalize_bol_url(original) if original else None
+                if norm:
+                    result.append(norm)
+            return result
+        except Exception as e:
+            logger.debug("CDX query error (%s): %s", prefix, e)
             return []
 
-        urls = _extract_bol_urls(resp.text)
-        logger.info("bol.com search page found %d URLs for '%s'", len(urls), title)
-        return urls
-    except Exception as e:
-        logger.warning("bol.com search page error: %s", e)
-        return []
+    results = await asyncio.gather(*[_cdx_query(p) for p in paths], return_exceptions=True)
+
+    seen: set[str] = set()
+    urls: list[str] = []
+    for batch in results:
+        if isinstance(batch, list):
+            for u in batch:
+                if u not in seen:
+                    seen.add(u)
+                    urls.append(u)
+
+    logger.info("Wayback CDX found %d URLs for slug '%s'", len(urls), slug)
+    return urls[:max_results]
 
 
 async def search_physical(
@@ -240,40 +269,39 @@ async def search_physical(
     tmdb_id: int,
     content_type: str = "movie",
 ) -> list[PhysicalOffer]:
-    cache_key = f"bol:physical:v6:{tmdb_id}:{content_type}"
+    cache_key = f"bol:physical:v7:{tmdb_id}:{content_type}"
     cached = await cache.get(cache_key)
     if cached:
         return [PhysicalOffer(**o) for o in cached]
 
     search_title = original_title or title
-    ddg_query = f'"{search_title}" blu-ray dvd bol.com'
 
     async with httpx.AsyncClient() as client:
-        # Deux sources en parallèle
-        ddg_urls, bol_urls = await asyncio.gather(
-            _ddg_html_search(ddg_query, client, 8),
-            _bol_search_page(search_title, client),
+        # Sources en parallèle
+        bing_urls, wayback_urls = await asyncio.gather(
+            _bing_search(search_title, client),
+            _wayback_search(search_title, client),
             return_exceptions=True,
         )
 
-        if isinstance(ddg_urls, Exception):
-            logger.warning("DDG task error: %s", ddg_urls)
-            ddg_urls = []
-        if isinstance(bol_urls, Exception):
-            logger.warning("bol search page task error: %s", bol_urls)
-            bol_urls = []
+        if isinstance(bing_urls, Exception):
+            logger.warning("Bing task error: %s", bing_urls)
+            bing_urls = []
+        if isinstance(wayback_urls, Exception):
+            logger.warning("Wayback task error: %s", wayback_urls)
+            wayback_urls = []
 
-        # Fusion + déduplication (DDG en priorité)
+        # Fusion + déduplication (Bing en priorité)
         seen: set[str] = set()
         all_urls: list[str] = []
-        for u in list(ddg_urls) + list(bol_urls):
+        for u in list(bing_urls) + list(wayback_urls):
             if u not in seen:
                 seen.add(u)
                 all_urls.append(u)
 
         logger.info(
-            "Total URLs for '%s': %d (DDG: %d, bol page: %d)",
-            search_title, len(all_urls), len(ddg_urls), len(bol_urls),
+            "URLs for '%s': %d total (Bing: %d, Wayback: %d)",
+            search_title, len(all_urls), len(bing_urls), len(wayback_urls),
         )
 
         if not all_urls:
