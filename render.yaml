@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: streaming-finder-be
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0
+      - key: COUNTRY
+        value: BE
+      - key: LANGUAGE
+        value: fr
+      - key: ALLOWED_ORIGINS
+        value: "*"
+      - key: TMDB_API_KEY
+        sync: false
